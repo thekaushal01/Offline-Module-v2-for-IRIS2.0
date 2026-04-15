@@ -80,6 +80,63 @@ iris_offline/
 
 ---
 
+## Architecture Overview
+
+IRIS 2.0 is built as a **multi-threaded real-time sensor fusion system** running on a single Raspberry Pi 5:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  IRIS 2.0 Offline Module — 5 Threads + Central Shared State                  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  │
+│  │ VisionThread         │  │ UltrasonicThread    │  │ FallDetection       │  │
+│  │ • PiCamera2          │  │ • GPIO23 (TRIG)     │  │ • I2C bus 1         │  │
+│  │ • YOLOv8n 10 FPS     │  │ • GPIO24 (ECHO)     │  │ • MPU9250 @ 50 Hz   │  │
+│  │ (640×480)            │  │ • 10 Hz polling     │  │                     │  │
+│  └─────────────┬────────┘  └─────────────┬───────┘  └──────────┬──────────┘  │
+│                │                         │                     │             │
+│                └─────────────────────────┼─────────────────────┘             │
+│                                          ▼                                   │
+│                       ┌───────────────────────────────────────┐              │
+│                       │ SharedState (Thread-safe RLock)       │              │
+│                       │                                       │              │
+│                       │ • detections[]   • fps                │              │
+│                       │ • distance_feet  • system_status      │              │
+│                       │ • fall.status    • errors[]           │              │
+│                       └────────────────┬──────────────────────┘              │
+│                                        │                                     │
+│                       ┌────────────────▼─────────────────┐                   │
+│                       │ ServerThread                     │                   │
+│                       │ (WebSocket port 8765)            │                   │
+│                       │                                  │                   │
+│                       │ Pushes JSON every 500ms to all   │                   │
+│                       │ connected clients                │                   │
+│                       └──────────────────────────────────┘                   │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Design Principles:**
+- **Single Source of Truth** — All modules write to/read from SharedState
+- **Thread Safety** — RLock prevents partial updates from being observed
+- **Graceful Degradation** — If any sensor fails, others continue running
+- **Non-blocking** — Each thread is independent; no single point waits for another
+- **Low Latency** — WebSocket pushes at 500ms; no buffering or batching
+
+**Why No Local Display?**
+
+The Vision thread stores annotated frames (with YOLO bounding boxes), but there is **no local display thread**. This design choice:
+
+- ✅ Reduces CPU/RAM overhead on the Pi (headless operation)
+- ✅ Allows monitoring from any client (web/mobile app, SSH session, Python script)
+- ✅ Avoids display dependency (works over SSH without X11/Wayland)
+- ✅ Enables future integration of streamed video endpoints if needed
+
+To monitor live detections: connect to the WebSocket endpoint and visualize on your client device.
+
+---
+
 ## Setup
 
 > Run all commands below directly in your Raspberry Pi terminal.
@@ -165,7 +222,49 @@ wscat -c ws://localhost:8765
 # Get your Pi's IP to connect from the companion app
 hostname -I
 # App connects to:  ws://<pi_ip>:8765
+
+# Or test with Python
+python3 << 'EOF'
+import asyncio, websockets, json
+async def test():
+    async with websockets.connect('ws://localhost:8765') as ws:
+        msg = await ws.recv()
+        data = json.loads(msg)
+        print(f"FPS: {data['fps']}, Distance: {data['distance_feet']}ft, Fall: {data['fall_detection']['status']}")
+asyncio.run(test())
+EOF
 ```
+
+**Typical Terminal Output:**
+
+```bash
+$ /opt/iris_offline/venv/bin/python /opt/iris_offline/main.py
+============================================================
+IRIS 2.0 Offline Module — Starting up
+============================================================
+Started UltrasonicThread
+Started FallDetectionThread
+Started VisionThread
+Started ServerThread
+All systems running. Press Ctrl+C or SIGTERM to stop.
+WebSocket JSON stream: ws://localhost:8765
+
+  FPS=11.2  dist=3.45ft  fall=normal  [person(89%)  backpack(72%)]  status=clear
+  FPS=11.0  dist=3.41ft  fall=normal  [person(91%)  backpack(75%)]  status=clear
+```
+
+---
+
+## WebSocket Server Behavior
+
+The server is **event-agnostic** and pushes a complete snapshot every 500ms regardless of whether data changed:
+
+- **Camera offline:** `fps=0.0`, `vision=[]`, errors include "Camera read error"
+- **I2C failing:** `fall_detection` fields included with last-known state
+- **Distance unstable:** `distance_feet` includes raw reading; client can apply smoothing
+- **Error auto-clear:** After 12 seconds of successful operation, transient errors are cleared from the errors list
+
+This design allows clients to detect system health degradation without explicit "status" endpoints.
 
 ---
 
@@ -213,33 +312,42 @@ The same `setup.sh` does both full setup and re-setup. It skips steps that are a
 
 **Endpoint:** `ws://<pi_ip>:8765`
 
-Connect with any WebSocket client. The server pushes a new JSON frame every 0.5 seconds.
+Connects with any WebSocket client. The server pushes a new JSON frame every **500ms** to all connected clients.
+
+**Payload Schema:**
+
+Each message is a complete snapshot of all currently active sensors:
 
 ```json
 {
-  "timestamp": "2026-02-25T10:30:45.123+00:00",
-  "vision": [
-    { "name": "chair",  "confidence": 0.91 },
-    { "name": "person", "confidence": 0.87 }
-  ],
+  "timestamp": "2026-02-25T10:30:45.123000Z",
+  "fps": 10.2,
   "distance_feet": 2.4,
+  "system_status": "warning",
   "fall_detection": {
     "status": "normal",
     "impact_g": 1.02
   },
-  "system_status": "warning",
-  "fps": 10.2,
+  "vision": [
+    { "name": "person", "confidence": 0.91 },
+    { "name": "chair", "confidence": 0.87 }
+  ],
   "errors": []
 }
 ```
 
-**`system_status` values:**
+**Field Reference:**
 
-| Value | When |
-|---|---|
-| `clear` | Everything normal |
-| `warning` | Obstacle closer than 3 feet |
-| `emergency` | Fall detected |
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | ISO-8601 string | UTC time when this snapshot was captured |
+| `fps` | float | Current inference FPS (rounded to 1 decimal) |
+| `distance_feet` | float | Distance from HC-SR04 sensor; -1.0 = unavailable |
+| `system_status` | string | `clear`, `warning` (obstacle < 3ft), or `emergency` (fall detected) |
+| `fall_detection.status` | string | `normal`, `impact_detected`, or `possible_fall` |
+| `fall_detection.impact_g` | float | Current total acceleration in Gs |
+| `vision[]` | array | Detected objects from YOLOv8n (max 20); sorted by confidence |
+| `errors[]` | array | List of active error messages (max 10); auto-cleared after 12s startup period |
 
 ---
 
@@ -264,16 +372,24 @@ If the person moves again before the 3-second immobility window completes, the s
 
 ---
 
-## Performance
+## Performance & Behavior
 
-| What | Target |
-|---|---|
-| Inference speed | 8–12 FPS at 640×480 |
-| Ultrasonic polling | 10 Hz with 5-sample median filter |
-| Fall detection | 50 Hz |
-| WebSocket push interval | 500ms |
-| RAM usage | < 500 MB total |
-| Continuous uptime | 8+ hours |
+| Component | Rate | Notes |
+|---|---|---|
+| WebSocket push | 500ms | Every connected client receives a JSON snapshot |
+| Vision (YOLO) | 8–12 FPS | YOLOv8n at 640×480 on Pi 5 CPU; max 20 detections per frame |
+| Ultrasonic (distance) | 10 Hz | 5-sample median filter applied |
+| Fall detection (IMU) | 50 Hz | Raw poll rate; state machine processes every 200ms |
+| Terminal status line | 500ms | Live feedback in the terminal without log spam |
+| Log file heartbeat | 30s | Periodic systemd journal entries for monitoring |
+| Startup error clear | 12s | Transient I2C/camera init errors are auto-cleared if resolved |
+
+**Memory & Resource Usage:**
+- RAM usage: < 500 MB (mostly YOLO model)
+- CPU usage: ~40–60% on Pi 5 (shared across 5 threads)
+- Continuous uptime: 8+ hours (with proper cooling)
+
+---
 
 ---
 
@@ -298,27 +414,18 @@ vcgencmd get_throttled   # 0x0 means no throttle has occurred
 
 ### MPU9250 not showing on I2C scan
 ```bash
-sudo i2cdetect -y 1          # check for 0x68 or 0x69
-dmesg | grep i2c             # look for errors
-sudo modprobe i2c-dev        # force-load the I2C module
-# Double-check: VCC = 3.3V (not 5V), AD0 tied to GND
+sudo i2cdetect -y 1   # check for 0x68 or 0x69
 ```
+If not found: VCC must be 3.3V (not 5V), and AD0 should be tied to GND.
 
 ### Camera not found
 ```bash
-rpicam-still --list-cameras    # should list at least one camera
-rpicam-still -t 0              # opens live preview — if this works, camera is fine
-python3 -c "from picamera2 import Picamera2; print(Picamera2.global_camera_info())"
-# If nothing shows: check ribbon cable is firmly seated in CAM0 port
-# Make sure camera is enabled: sudo raspi-config → Interface Options → Camera
+rpicam-still --list-cameras   # should list at least one camera
 ```
+If none appear: check ribbon cable is firmly seated in CAM0 port, and verify camera is enabled via `sudo raspi-config`.
 
-### HC-SR04 giving wrong values
-```bash
-# Most common cause: missing voltage divider on ECHO pin
-# ECHO outputs 5V — the Pi GPIO will be damaged without the divider
-gpio -g read 24   # should read 0 at rest
-```
+### HC-SR04 giving wrong distance
+Most common cause: **missing voltage divider on ECHO pin**. ECHO outputs 5V — the Pi GPIO will be damaged without the divider (1kΩ to GPIO, 2kΩ to GND).
 
 ### WebSocket not reachable
 ```bash
@@ -341,16 +448,14 @@ asyncio.run(t())
 
 ### Low FPS
 ```bash
-vcgencmd get_throttled          # 0x0 = fine, anything else = problem
-vcgencmd measure_temp           # check for heat throttle
-top -H -p $(pgrep -f main.py)  # see per-thread CPU usage
-# To reduce load: increase SKIP_FRAMES in vision.py from 1 to 2 or 3
+vcgencmd get_throttled        # 0x0 = fine; anything else = throttling occurred
+vcgencmd measure_temp         # check current temperature
 ```
+If throttled: attach active cooler, use vented case, check PSU is official 27W model.
 
 ### Check memory usage
 ```bash
-watch -n5 "ps aux --sort=-%mem | head -8"
-cat /proc/$(pgrep -f main.py)/status | grep VmRSS
+ps aux | grep main.py | grep -v grep   # quick check of IRIS process
 ```
 
 ---
